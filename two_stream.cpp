@@ -27,7 +27,7 @@
 
 // ---- Default simulation parameters ----------------------------------------
 static constexpr uint   DEFAULT_NX    = 1024u;
-static constexpr uint   DEFAULT_NP    = 1u<<12;  // 2^12 ~= 4,000
+static constexpr uint   DEFAULT_NP    = 1u<<14;  // 2^12 ~= 4,000
 // static constexpr uint   DEFAULT_NP    = 1u<<20;          // 1,048,576
 static const     float  DEFAULT_L     = 4.0f*pif;        // ~12.566; fits one unstable wavelength for k0=0.5
 static constexpr float  DEFAULT_V0    = 1.0f;

@@ -4,6 +4,8 @@ Self-contained OpenCL demos, heavily based on [FluidX3D](https://github.com/Proj
 
 Currently one demo: **`two_stream`** — a 1D-1V electrostatic particle-in-cell simulation of the two-stream instability with live phase-space rendering.
 
+![two-stream-demo.gif](two-stream-demo.gif)
+
 ## Build
 
 System dependencies (one-time):
