@@ -208,7 +208,7 @@ int main(int argc, char* argv[]) {
 	// Blending mode is selected per-frame from draw_circles below.
 
 	// ---- UI state ---------------------------------------------------------
-	bool  paused        = false;
+	bool  paused        = true;
 	int   substeps      = 1;
 	float vmax_view     = 8.0f;
 	int   stride_view   = 1; // render every Nth particle (1 = all)
