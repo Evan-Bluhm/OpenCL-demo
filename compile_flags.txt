@@ -1,0 +1,13 @@
+-std=c++17
+-pthread
+-Isrc
+-Isrc/OpenCL/include
+-isystem
+extern/imgui
+-isystem
+extern/imgui/backends
+-I/opt/homebrew/include
+-I/usr/local/include
+-Wno-comment
+-Wno-unused-result
+-Wno-deprecated-declarations
