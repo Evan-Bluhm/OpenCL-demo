@@ -134,8 +134,11 @@ public:
 		Memory<float>& xb = x_curr();
 		Memory<float>& vb = v_curr();
 		Memory<float>& sb = s_curr();
+		// Interleave streams in x so both populations span the whole domain.
+		// Even index -> right-mover, odd index -> left-mover. Positions are placed on a
+		// uniform grid of Np points so neither stream is spatially clustered.
 		for(uint i=0u; i<Np; i++) {
-			const bool right_mover = (i<Np/2u); // first half = right-moving stream (+v0)
+			const bool right_mover = ((i&1u)==0u);
 			const float v_mean = right_mover ? +v0 : -v0;
 			float xp = ((float)i+0.5f)*L/(float)Np;
 			xp += seed_amp*sin(k0*xp);
