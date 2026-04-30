@@ -27,9 +27,9 @@
 
 // ---- Default simulation parameters ----------------------------------------
 static constexpr uint   DEFAULT_NX    = 1024u;
-static constexpr uint   DEFAULT_NP    = 1u<<14;  // 2^12 ~= 4,000
-// static constexpr uint   DEFAULT_NP    = 1u<<20;          // 1,048,576
-static const     float  DEFAULT_L     = 4.0f*pif;        // ~12.566; fits one unstable wavelength for k0=0.5
+// static constexpr uint   DEFAULT_NP    = 1u<<14;  // 2^12 ~= 4,000
+static constexpr uint   DEFAULT_NP    = 1u<<18;          // 1,048,576
+static const     float  DEFAULT_L     = 8.0f*pif;        // ~25.13; mode k=4 sits near peak growth (K=k*v0/omega_p=1.0, gamma~0.49 vs gamma_max=0.5). k=1,2 also unstable; k=8 is at the stability boundary.
 static constexpr float  DEFAULT_V0    = 1.0f;
 static constexpr float  DEFAULT_VT    = 0.1f;
 static constexpr float  DEFAULT_DT    = 0.1f;            // omega_p * dt = 0.1
@@ -137,7 +137,7 @@ int main(int argc, char* argv[]) {
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-	GLFWwindow* win = glfwCreateWindow(1280, 720, "two-stream PIC (OpenCL)", nullptr, nullptr);
+	GLFWwindow* win = glfwCreateWindow(1280, 720, "Two-stream Instability PIC", nullptr, nullptr);
 	if(!win) {
 		std::fprintf(stderr, "glfwCreateWindow failed\n");
 		glfwTerminate();
@@ -213,9 +213,23 @@ int main(int argc, char* argv[]) {
 	float vmax_view     = 8.0f;
 	int   stride_view   = 1; // render every Nth particle (1 = all)
 	bool  draw_circles  = true;  // true = opaque filled circle (default), false = translucent square (additive)
-	bool  show_grid     = false; // overlay vertical lines at each cell boundary
-	int   view_mode     = 0;     // 0 = phase space (particles), 1 = electric field E(x)
-	float emax_view     = 1.0f;  // y-axis half-range for the E-field plot
+	bool  show_grid     = false; // overlay vertical lines at each cell boundary on the phase-space plot
+	float emax_view     = 1.0f;  // y-axis half-range for the E(x) plot
+	float fmax_view     = 0.0f;  // y-axis upper limit for the f(v) histogram; 0 = auto-scale
+	constexpr int hist_bins = 64;
+
+	// Energy time-series, appended once per non-paused frame and cleared by Reset.
+	// Running min/max drive auto-scaling of the energy plot's y-axis.
+	bool  energy_log = true;
+	vector<float> hist_t, hist_ke, hist_pe, hist_te;
+	float energy_max_tracked     = 0.0f;
+	float energy_min_pos_tracked = INFINITY;
+
+	// Wavenumber of the sinusoidal seed used by Reset: 1 = one wavelength across
+	// the box, 2 = two, etc. Linear theory predicts modes with k*v0/omega_p < 1
+	// to be unstable, so for v0=1, L=4*pi only k=1 is clearly inside the unstable
+	// band — k=2,4,8 are educational comparisons.
+	int init_k = 1;
 
 	// ---- Diagnostics bookkeeping -----------------------------------------
 	double last_diag_t = glfwGetTime();
@@ -239,82 +253,123 @@ int main(int argc, char* argv[]) {
 		sim.read_state_to_host();
 		sim.compute_energies();
 
-		// Clear the framebuffer (both view modes share this).
+		// Append a sample to the energy time-series. Only when stepping —
+		// otherwise we'd accumulate duplicate points while the user inspects
+		// the paused state.
+		if(!paused) {
+			hist_t .push_back((float)sim.t);
+			hist_ke.push_back(sim.ke);
+			hist_pe.push_back(sim.pe);
+			const float te = sim.ke+sim.pe;
+			hist_te.push_back(te);
+			if(sim.ke>energy_max_tracked) energy_max_tracked = sim.ke;
+			if(sim.pe>energy_max_tracked) energy_max_tracked = sim.pe;
+			if(te    >energy_max_tracked) energy_max_tracked = te;
+			if(sim.ke>0.0f && sim.ke<energy_min_pos_tracked) energy_min_pos_tracked = sim.ke;
+			if(sim.pe>0.0f && sim.pe<energy_min_pos_tracked) energy_min_pos_tracked = sim.pe;
+			if(te    >0.0f && te    <energy_min_pos_tracked) energy_min_pos_tracked = te;
+		}
+
+		// Clear the framebuffer (all panels share this).
 		int win_w, win_h;
 		glfwGetFramebufferSize(win, &win_w, &win_h);
 		glViewport(0, 0, win_w, win_h);
 		glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 
-		// Plot rectangle in NDC, computed from logical window size so the
-		// control panel on the left and label margins are reserved consistently.
-		// Used by both the GL particle pass and the ImGui-overlay annotations.
+		// 2x2 grid of plot rectangles in logical pixels:
+		//   phase space (top-left, large)    f(v)  (top-right, small)
+		//   energy      (bottom-left, large) E(x)  (bottom-right, small)
+		// Everything else (control panel, axis-text margins) is reserved space.
 		int wlog_w, wlog_h;
 		glfwGetWindowSize(win, &wlog_w, &wlog_h);
-		const float panel_w     = 300.0f;             // logical pixels reserved for left panel
-		const float plot_left   = panel_w + 56.0f;    // gap for y-axis word + tick text
-		const float plot_right  = (float)wlog_w - 16.0f;
-		const float plot_top    = 28.0f;              // gap for title text
-		const float plot_bottom = (float)wlog_h - 48.0f; // gap for x-axis ticks + label
-		const float x0_ndc = -1.0f + 2.0f*plot_left   /(float)wlog_w;
-		const float x1_ndc = -1.0f + 2.0f*plot_right  /(float)wlog_w;
-		const float y0_ndc =  1.0f - 2.0f*plot_bottom /(float)wlog_h;
-		const float y1_ndc =  1.0f - 2.0f*plot_top    /(float)wlog_h;
+		const float panel_w   = 300.0f; // logical pixels reserved for left control panel
+		const float gap_yword = 56.0f;  // space at left of each plot for vertical y-axis word + tick numerals
+		const float gap_top   = 28.0f;  // space above each plot for its title
+		const float gap_bot   = 48.0f;  // space below each plot for x-tick labels + axis word
+		const float gap_right = 16.0f;
 
-		// In phase-space mode, upload particles to VBOs and draw them via GL.
-		// Field mode draws E(x) via ImGui's draw list below, no GL particles.
-		uint Np_draw = 0u;
-		if(view_mode==0) {
-			Np_draw = (sim.Np+(uint)stride_view-1u)/(uint)stride_view;
-			glBindBuffer(GL_ARRAY_BUFFER, vbo_x);
-			if(stride_view==1) {
-				glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.x_curr().data());
-			} else {
-				draw_tmp.resize(Np_draw);
-				const float* src = sim.x_curr().data();
-				for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
-				glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
-			}
-			glBindBuffer(GL_ARRAY_BUFFER, vbo_v);
-			if(stride_view==1) {
-				glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.v_curr().data());
-			} else {
-				draw_tmp.resize(Np_draw);
-				const float* src = sim.v_curr().data();
-				for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
-				glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
-			}
-			glBindBuffer(GL_ARRAY_BUFFER, vbo_s);
-			if(stride_view==1) {
-				glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.s_curr().data());
-			} else {
-				draw_tmp.resize(Np_draw);
-				const float* src = sim.s_curr().data();
-				for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
-				glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
-			}
+		// Right column takes ~35% of the area after the control panel; rows split evenly.
+		const float right_col_w = 0.35f*((float)wlog_w-panel_w);
+		const float right_col_x = (float)wlog_w-right_col_w;
+		const float mid_y       = 0.5f*(float)wlog_h;
 
-			// Opaque circles: no blending — alpha=1 is meaningful only when each
-			// fragment fully replaces what's beneath. Translucent squares: additive
-			// blending so overlapping particles brighten dense regions.
-			if(draw_circles) {
-				glDisable(GL_BLEND);
-			} else {
-				glEnable(GL_BLEND);
-				glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-			}
+		const float ps_left  = panel_w     + gap_yword;
+		const float ps_right = right_col_x - gap_right;
+		const float ps_top   = gap_top;
+		const float ps_bot   = mid_y - gap_bot;
 
-			glUseProgram(prog);
-			glUniform1f(uL, sim.L);
-			glUniform1f(uVmax, vmax_view);
-			glUniform1f(uPointsize, pointsize);
-			glUniform2f(uXRange, x0_ndc, x1_ndc);
-			glUniform2f(uYRange, y0_ndc, y1_ndc);
-			glUniform1i(uShape, draw_circles ? 1 : 0);
-			glBindVertexArray(vao);
-			glDrawArrays(GL_POINTS, 0, (GLsizei)Np_draw);
-			glBindVertexArray(0);
+		const float en_left  = panel_w     + gap_yword;
+		const float en_right = right_col_x - gap_right;
+		const float en_top   = mid_y + gap_top;
+		const float en_bot   = (float)wlog_h - gap_bot;
+
+		const float f_left   = right_col_x + gap_yword;
+		const float f_right  = (float)wlog_w - gap_right;
+		const float f_top    = gap_top;
+		const float f_bot    = mid_y - gap_bot;
+
+		const float e_left   = right_col_x + gap_yword;
+		const float e_right  = (float)wlog_w - gap_right;
+		const float e_top    = mid_y + gap_top;
+		const float e_bot    = (float)wlog_h - gap_bot;
+
+		// Phase-space rect in NDC (used by the GL particle pass).
+		const float ps_x0_ndc = -1.0f + 2.0f*ps_left /(float)wlog_w;
+		const float ps_x1_ndc = -1.0f + 2.0f*ps_right/(float)wlog_w;
+		const float ps_y0_ndc =  1.0f - 2.0f*ps_bot  /(float)wlog_h;
+		const float ps_y1_ndc =  1.0f - 2.0f*ps_top  /(float)wlog_h;
+
+		// Upload particles to VBOs and draw the phase-space scatter via GL.
+		const uint Np_draw = (sim.Np+(uint)stride_view-1u)/(uint)stride_view;
+		glBindBuffer(GL_ARRAY_BUFFER, vbo_x);
+		if(stride_view==1) {
+			glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.x_curr().data());
+		} else {
+			draw_tmp.resize(Np_draw);
+			const float* src = sim.x_curr().data();
+			for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
+			glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
 		}
+		glBindBuffer(GL_ARRAY_BUFFER, vbo_v);
+		if(stride_view==1) {
+			glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.v_curr().data());
+		} else {
+			draw_tmp.resize(Np_draw);
+			const float* src = sim.v_curr().data();
+			for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
+			glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
+		}
+		glBindBuffer(GL_ARRAY_BUFFER, vbo_s);
+		if(stride_view==1) {
+			glBufferSubData(GL_ARRAY_BUFFER, 0, sim.Np*sizeof(float), sim.s_curr().data());
+		} else {
+			draw_tmp.resize(Np_draw);
+			const float* src = sim.s_curr().data();
+			for(uint i=0u; i<Np_draw; i++) draw_tmp[i] = src[i*(uint)stride_view];
+			glBufferSubData(GL_ARRAY_BUFFER, 0, Np_draw*sizeof(float), draw_tmp.data());
+		}
+
+		// Opaque circles: no blending — alpha=1 is meaningful only when each
+		// fragment fully replaces what's beneath. Translucent squares: additive
+		// blending so overlapping particles brighten dense regions.
+		if(draw_circles) {
+			glDisable(GL_BLEND);
+		} else {
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+		}
+
+		glUseProgram(prog);
+		glUniform1f(uL, sim.L);
+		glUniform1f(uVmax, vmax_view);
+		glUniform1f(uPointsize, pointsize);
+		glUniform2f(uXRange, ps_x0_ndc, ps_x1_ndc);
+		glUniform2f(uYRange, ps_y0_ndc, ps_y1_ndc);
+		glUniform1i(uShape, draw_circles ? 1 : 0);
+		glBindVertexArray(vao);
+		glDrawArrays(GL_POINTS, 0, (GLsizei)Np_draw);
+		glBindVertexArray(0);
 
 		// ---- ImGui overlay -----------------------------------------------
 		ImGui_ImplOpenGL3_NewFrame();
@@ -348,113 +403,293 @@ int main(int argc, char* argv[]) {
 		ImGui::SliderInt("Substeps/frame", &substeps, 1, 50);
 
 		ImGui::Separator();
-		ImGui::Text("View:");
-		ImGui::SameLine(); ImGui::RadioButton("phase space", &view_mode, 0);
-		ImGui::SameLine(); ImGui::RadioButton("E field",     &view_mode, 1);
-		ImGui::Checkbox("Show grid", &show_grid);
-		if(view_mode==0) {
-			ImGui::SliderFloat("v range", &vmax_view, 0.5f, 5.0f);
-			ImGui::SliderInt("Render stride", &stride_view, 1, 32);
-			ImGui::Checkbox("Filled circles", &draw_circles);
-		} else {
-			ImGui::SliderFloat("E range", &emax_view, 0.05f, 5.0f);
+		ImGui::TextUnformatted("Phase space");
+		ImGui::SliderFloat("v range",     &vmax_view, 0.5f, 5.0f);
+		ImGui::SliderInt("Render stride", &stride_view, 1, 32);
+		ImGui::Checkbox("Filled circles", &draw_circles);
+		ImGui::Checkbox("Show grid",      &show_grid);
+		ImGui::Separator();
+		ImGui::TextUnformatted("E field");
+		ImGui::SliderFloat("E range",     &emax_view, 0.05f, 5.0f);
+		ImGui::Separator();
+		ImGui::TextUnformatted("f(v)");
+		ImGui::SliderFloat("f range",     &fmax_view, 0.0f, 5.0f);
+		ImGui::TextDisabled("(0 = auto-scale)");
+		ImGui::Separator();
+		ImGui::TextUnformatted("Energy");
+		ImGui::Checkbox("Log scale##E",   &energy_log);
+		ImGui::Separator();
+		ImGui::TextUnformatted("Initial perturbation (on Reset)");
+		ImGui::RadioButton("k=1", &init_k, 1); ImGui::SameLine();
+		ImGui::RadioButton("k=2", &init_k, 2); ImGui::SameLine();
+		// ImGui::RadioButton("k=4", &init_k, 4); ImGui::SameLine();
+		ImGui::RadioButton("k=4", &init_k, 4);
+		if(ImGui::Button("Reset")) {
+			sim.initialize_two_stream((uint)init_k);
+			hist_t.clear();
+			hist_ke.clear();
+			hist_pe.clear();
+			hist_te.clear();
+			energy_max_tracked     = 0.0f;
+			energy_min_pos_tracked = INFINITY;
 		}
-		if(ImGui::Button("Reset")) sim.initialize_two_stream();
 		ImGui::End();
 
-		// ---- Axis / overlay rendering on top of the plot ----------------
-		// Uses the same plot rectangle (x0_ndc..x1_ndc, y0_ndc..y1_ndc) computed
-		// at the top of this frame so the labels line up with the GL viewport.
+		// ---- Axis / overlay rendering on top of the three plots ----------
 		{
-			const ImVec2 disp = ImGui::GetIO().DisplaySize; // logical pixels
-			auto ndc_to_px = [&](float nx, float ny) {
-				return ImVec2((nx+1.0f)*0.5f*disp.x, (1.0f-ny)*0.5f*disp.y);
-			};
-			const ImVec2 tl  = ndc_to_px(x0_ndc, y1_ndc); // top-left of plot rect
-			const ImVec2 br  = ndc_to_px(x1_ndc, y0_ndc); // bottom-right
-			const ImVec2 axL = ndc_to_px(x0_ndc, 0.0f);   // y=0 axis line endpoints
-			const ImVec2 axR = ndc_to_px(x1_ndc, 0.0f);
 			ImDrawList* dl = ImGui::GetForegroundDrawList();
-			const ImU32 col_frame = IM_COL32(220, 220, 220, 220);
-			const ImU32 col_axis  = IM_COL32(180, 180, 180, 110);
-			const ImU32 col_text  = IM_COL32(230, 230, 235, 255);
-			const ImU32 col_dim   = IM_COL32(180, 180, 190, 200);
-			const ImU32 col_grid  = IM_COL32(120, 130, 160,  80);
-			const ImU32 col_field = IM_COL32(255, 210,  90, 255);
+			const ImU32 col_frame   = IM_COL32(220, 220, 220, 220);
+			const ImU32 col_axis    = IM_COL32(180, 180, 180, 110);
+			const ImU32 col_text    = IM_COL32(230, 230, 235, 255);
+			const ImU32 col_dim     = IM_COL32(180, 180, 190, 200);
+			const ImU32 col_grid    = IM_COL32(120, 130, 160,  80);
+			const ImU32 col_field   = IM_COL32(255, 210,  90, 255);
+			// Histogram trace colors must match FRAG_SRC's per-stream colors so the
+			// f(v) plot's blue/orange line up with the phase-space dot colors.
+			const ImU32 col_stream0 = IM_COL32( 76, 178, 255, 255); // right-mover (blue)
+			const ImU32 col_stream1 = IM_COL32(255, 140,  51, 255); // left-mover  (orange)
 
-			// Optional grid: vertical line at every cell node x = i*dx for i=0..Nx.
-			// Even at Nx=1024 this is a few thousand line vertices for ImGui.
+			// Frame + title + axis ticks + axis words for one rectangular plot.
+			// `yt_mid` is null when the y range doesn't cross zero (f(v) is 0..fmax);
+			// when non-null it adds a horizontal axis line at the rect midpoint and a
+			// "0" tick label there.
+			auto draw_plot_frame = [&](float x0, float y0, float x1, float y1,
+			                           const char* title,
+			                           const char* x_word, const char* xt_lo, const char* xt_hi,
+			                           const char* y_word, const char* yt_lo, const char* yt_hi,
+			                           const char* yt_mid) {
+				const ImVec2 tl(x0, y0);
+				const ImVec2 br(x1, y1);
+				dl->AddRect(tl, br, col_frame, 0.0f, 0, 1.0f);
+				if(yt_mid) {
+					const float ymid = 0.5f*(tl.y+br.y);
+					dl->AddLine(ImVec2(tl.x, ymid), ImVec2(br.x, ymid), col_axis, 1.0f);
+				}
+				ImVec2 ts;
+				ts = ImGui::CalcTextSize(title);
+				dl->AddText(ImVec2(0.5f*(tl.x+br.x)-0.5f*ts.x, tl.y-ts.y-6.0f), col_text, title);
+				ts = ImGui::CalcTextSize(xt_lo);
+				dl->AddText(ImVec2(tl.x-0.5f*ts.x, br.y+3.0f), col_dim, xt_lo);
+				ts = ImGui::CalcTextSize(xt_hi);
+				dl->AddText(ImVec2(br.x-ts.x, br.y+3.0f), col_dim, xt_hi);
+				ts = ImGui::CalcTextSize(x_word);
+				dl->AddText(ImVec2(0.5f*(tl.x+br.x)-0.5f*ts.x, br.y+20.0f), col_text, x_word);
+				ts = ImGui::CalcTextSize(yt_hi);
+				dl->AddText(ImVec2(tl.x-ts.x-6.0f, tl.y-0.5f*ts.y), col_dim, yt_hi);
+				ts = ImGui::CalcTextSize(yt_lo);
+				dl->AddText(ImVec2(tl.x-ts.x-6.0f, br.y-0.5f*ts.y), col_dim, yt_lo);
+				if(yt_mid) {
+					ts = ImGui::CalcTextSize(yt_mid);
+					const float ymid = 0.5f*(tl.y+br.y);
+					dl->AddText(ImVec2(tl.x-ts.x-6.0f, ymid-0.5f*ts.y), col_dim, yt_mid);
+				}
+				// Y-axis word, stacked vertically (ImGui has no rotated text).
+				const float y_word_x = tl.x-50.0f;
+				float y_cursor = 0.5f*(tl.y+br.y)-0.5f*(float)strlen(y_word)*ImGui::GetFontSize();
+				for(const char* p=y_word; *p; p++) {
+					char ch[2] = { *p, 0 };
+					dl->AddText(ImVec2(y_word_x, y_cursor), col_text, ch);
+					y_cursor += ImGui::GetFontSize();
+				}
+			};
+
+			char xt_hi_buf[32], yt_hi_buf[32], yt_lo_buf[32];
+
+			// ---- Phase-space plot (particles drawn via GL above; only annotations here) ----
 			if(show_grid) {
-				const float plot_w = br.x-tl.x;
+				const float plot_w = ps_right-ps_left;
 				for(uint i=0u; i<=sim.Nx; i++) {
 					const float fx = (float)i/(float)sim.Nx;
-					const float px = tl.x+fx*plot_w;
-					dl->AddLine(ImVec2(px, tl.y), ImVec2(px, br.y), col_grid, 1.0f);
+					const float px = ps_left+fx*plot_w;
+					dl->AddLine(ImVec2(px, ps_top), ImVec2(px, ps_bot), col_grid, 1.0f);
 				}
 			}
+			snprintf(xt_hi_buf, sizeof(xt_hi_buf), "L = %.2f", sim.L);
+			snprintf(yt_hi_buf, sizeof(yt_hi_buf), "+%.2f", vmax_view);
+			snprintf(yt_lo_buf, sizeof(yt_lo_buf), "-%.2f", vmax_view);
+			draw_plot_frame(ps_left, ps_top, ps_right, ps_bot,
+				"1d1v phase space",
+				"x  (position)", "0",       xt_hi_buf,
+				"v  velocity",   yt_lo_buf, yt_hi_buf, "0");
 
-			// In field mode, draw the E(x) curve as a polyline. E was already
-			// pulled to host this frame by sim.read_state_to_host().
-			if(view_mode==1) {
+			// ---- E(x) plot ----
+			{
 				static vector<ImVec2> pts;
 				pts.resize(sim.Nx);
-				const float plot_w = br.x-tl.x;
-				const float plot_h = br.y-tl.y;
+				const float plot_w = e_right-e_left;
+				const float plot_h = e_bot-e_top;
 				for(uint i=0u; i<sim.Nx; i++) {
 					const float fx = (float)i/(float)sim.Nx;
 					float fy = 0.5f-0.5f*sim.E[i]/emax_view; // y flipped: +E is up
 					if(fy<0.0f) fy = 0.0f;
 					if(fy>1.0f) fy = 1.0f;
-					pts[i] = ImVec2(tl.x+fx*plot_w, tl.y+fy*plot_h);
+					pts[i] = ImVec2(e_left+fx*plot_w, e_top+fy*plot_h);
 				}
 				dl->AddPolyline(pts.data(), (int)pts.size(), col_field, ImDrawFlags_None, 1.5f);
 			}
+			snprintf(xt_hi_buf, sizeof(xt_hi_buf), "L = %.2f", sim.L);
+			snprintf(yt_hi_buf, sizeof(yt_hi_buf), "+%.2f", emax_view);
+			snprintf(yt_lo_buf, sizeof(yt_lo_buf), "-%.2f", emax_view);
+			draw_plot_frame(e_left, e_top, e_right, e_bot,
+				"electric field  E(x)",
+				"x  (position)", "0",       xt_hi_buf,
+				"E  field",      yt_lo_buf, yt_hi_buf, "0");
 
-			// Plot frame and y=0 axis line (drawn after grid/curve so they stay on top).
-			dl->AddRect(tl, br, col_frame, 0.0f, 0, 1.0f);
-			dl->AddLine(axL, axR, col_axis, 1.0f);
+			// ---- f(v) histogram, two stepped curves (one per initial-stream tag) ----
+			{
+				// Bin v into hist_bins over [-vmax_view, +vmax_view], split by initial stream.
+				static vector<int> hist0, hist1;
+				hist0.assign(hist_bins, 0);
+				hist1.assign(hist_bins, 0);
+				const float* vp = sim.v_curr().data();
+				const float* sp = sim.s_curr().data();
+				const float scale = (float)hist_bins/(2.0f*vmax_view);
+				for(uint i=0u; i<sim.Np; i++) {
+					const float fx = (vp[i]+vmax_view)*scale;
+					if(fx<0.0f || fx>=(float)hist_bins) continue; // off the plot, drop it
+					const int bin = (int)fx;
+					if(sp[i]<0.5f) hist0[bin]++;
+					else           hist1[bin]++;
+				}
+				// PDF normalization: dividing count_per_bin by Np*dv makes the *total*
+				// f integrate to 1 over v; each stream alone integrates to ~0.5 since
+				// it's half the population.
+				const float dv = 2.0f*vmax_view/(float)hist_bins;
+				const float pdf_norm = 1.0f/((float)sim.Np*dv);
 
-			// Mode-dependent labels.
-			const char* title    = (view_mode==0) ? "1d1v phase space" : "electric field  E(x)";
-			const char* y_word   = (view_mode==0) ? "v  velocity"      : "E  field";
-			const float y_range  = (view_mode==0) ? vmax_view          : emax_view;
+				float fmax_eff = fmax_view;
+				if(fmax_eff<=0.0f) {
+					float m = 0.0f;
+					for(int b=0; b<hist_bins; b++) {
+						const float f0 = (float)hist0[b]*pdf_norm;
+						const float f1 = (float)hist1[b]*pdf_norm;
+						if(f0>m) m = f0;
+						if(f1>m) m = f1;
+					}
+					fmax_eff = m>0.0f ? 1.1f*m : 1.0f;
+				}
 
-			char buf[64];
-			ImVec2 ts;
+				const float plot_w = f_right-f_left;
+				const float plot_h = f_bot-f_top;
+				// Stepped polyline: 2 vertices per bin (left edge + right edge at the
+				// same height) -> flat top across each bin, vertical drops between bins.
+				static vector<ImVec2> pts0, pts1;
+				pts0.resize(2*(size_t)hist_bins);
+				pts1.resize(2*(size_t)hist_bins);
+				for(int b=0; b<hist_bins; b++) {
+					const float fxL = (float)b/(float)hist_bins;
+					const float fxR = (float)(b+1)/(float)hist_bins;
+					const float xL = f_left+fxL*plot_w;
+					const float xR = f_left+fxR*plot_w;
+					const float f0 = (float)hist0[b]*pdf_norm;
+					const float f1 = (float)hist1[b]*pdf_norm;
+					float y0 = f_bot-(f0/fmax_eff)*plot_h;
+					float y1 = f_bot-(f1/fmax_eff)*plot_h;
+					if(y0<f_top) y0 = f_top;
+					if(y1<f_top) y1 = f_top;
+					pts0[2*b]   = ImVec2(xL, y0);
+					pts0[2*b+1] = ImVec2(xR, y0);
+					pts1[2*b]   = ImVec2(xL, y1);
+					pts1[2*b+1] = ImVec2(xR, y1);
+				}
+				dl->AddPolyline(pts0.data(), (int)pts0.size(), col_stream0, ImDrawFlags_None, 1.5f);
+				dl->AddPolyline(pts1.data(), (int)pts1.size(), col_stream1, ImDrawFlags_None, 1.5f);
 
-			// Title centered above the plot.
-			ts = ImGui::CalcTextSize(title);
-			dl->AddText(ImVec2(0.5f*(tl.x+br.x)-0.5f*ts.x, tl.y-ts.y-6.0f), col_text, title);
+				snprintf(xt_hi_buf, sizeof(xt_hi_buf), "+%.2f", vmax_view);
+				snprintf(yt_lo_buf, sizeof(yt_lo_buf), "-%.2f", vmax_view); // x-axis low tick (reused buffer)
+				snprintf(yt_hi_buf, sizeof(yt_hi_buf), "%.3f", fmax_eff);
+				draw_plot_frame(f_left, f_top, f_right, f_bot,
+					"distribution  f(v)",
+					"v  velocity", yt_lo_buf, xt_hi_buf,
+					"f",           "0",       yt_hi_buf, nullptr);
+			}
 
-			// X-axis tick labels (0 and L) under the plot, plus axis label "x".
-			snprintf(buf, sizeof(buf), "0");
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(tl.x-0.5f*ts.x, br.y+3.0f), col_dim, buf);
-			snprintf(buf, sizeof(buf), "L = %.2f", sim.L);
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(br.x-ts.x, br.y+3.0f), col_dim, buf);
-			snprintf(buf, sizeof(buf), "x  (position)");
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(0.5f*(tl.x+br.x)-0.5f*ts.x, br.y+20.0f), col_text, buf);
+			// ---- Energy plot: KE, PE, KE+PE vs t (log y by default) ----
+			{
+				const ImU32 col_ke = IM_COL32( 80, 160, 255, 255); // blue
+				const ImU32 col_pe = IM_COL32(120, 220, 100, 255); // green
+				const ImU32 col_te = IM_COL32(255,  90,  90, 255); // red
 
-			// Y-axis tick labels and axis label.
-			snprintf(buf, sizeof(buf), "+%.2f", y_range);
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(tl.x-ts.x-6.0f, tl.y-0.5f*ts.y), col_dim, buf);
-			snprintf(buf, sizeof(buf), "0");
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(tl.x-ts.x-6.0f, axL.y-0.5f*ts.y), col_dim, buf);
-			snprintf(buf, sizeof(buf), "-%.2f", y_range);
-			ts = ImGui::CalcTextSize(buf);
-			dl->AddText(ImVec2(tl.x-ts.x-6.0f, br.y-0.5f*ts.y), col_dim, buf);
-			// Stack the y-axis word vertically (ImGui has no rotated text).
-			// Place it just to the right of the panel, left of the tick labels.
-			const float y_word_x = panel_w + 6.0f;
-			float y_cursor = 0.5f*(tl.y+br.y)-0.5f*(float)strlen(y_word)*ImGui::GetFontSize();
-			for(const char* p=y_word; *p; p++) {
-				char ch[2] = { *p, 0 };
-				dl->AddText(ImVec2(y_word_x, y_cursor), col_text, ch);
-				y_cursor += ImGui::GetFontSize();
+				// Y-axis range. In log mode, snap to whole decades just outside the
+				// observed min/max; in linear mode, 0..1.1*max. Both are sticky against
+				// the running min/max so the axis doesn't jitter as new extremes appear.
+				float y_lo, y_hi;
+				if(energy_log) {
+					const float lo_v = energy_min_pos_tracked<INFINITY ? energy_min_pos_tracked : 1e-12f;
+					const float hi_v = energy_max_tracked>0.0f         ? energy_max_tracked     : 1.0f;
+					y_lo = floorf(log10f(lo_v));
+					y_hi = ceilf (log10f(hi_v));
+					if(y_hi-y_lo<2.0f) y_lo = y_hi-2.0f;
+				} else {
+					y_lo = 0.0f;
+					y_hi = energy_max_tracked>0.0f ? 1.1f*energy_max_tracked : 1.0f;
+				}
+				const float t_max = (!hist_t.empty() && hist_t.back()>1.0f) ? hist_t.back() : 1.0f;
+
+				const float plot_w = en_right-en_left;
+				const float plot_h = en_bot-en_top;
+				const int   N      = (int)hist_t.size();
+
+				if(N>=2) {
+					// Decimate to ~one vertex per pixel column to keep ImGui draw cost bounded
+					// even for very long runs.
+					const int max_vertices = (int)plot_w>2 ? (int)plot_w : 2;
+					const int stride = N>max_vertices ? N/max_vertices : 1;
+
+					auto build_curve = [&](const vector<float>& vals, vector<ImVec2>& pts) {
+						pts.clear();
+						pts.reserve((size_t)((N+stride-1)/stride));
+						for(int i=0; i<N; i+=stride) {
+							const float fx = hist_t[i]/t_max;
+							float fy;
+							if(energy_log) {
+								const float lv = log10f(vals[i]>1e-30f ? vals[i] : 1e-30f);
+								fy = (lv-y_lo)/(y_hi-y_lo);
+							} else {
+								fy = (vals[i]-y_lo)/(y_hi-y_lo);
+							}
+							if(fy<0.0f) fy = 0.0f;
+							if(fy>1.0f) fy = 1.0f;
+							pts.push_back(ImVec2(en_left+fx*plot_w, en_bot-fy*plot_h));
+						}
+					};
+
+					static vector<ImVec2> pts_ke, pts_pe, pts_te;
+					build_curve(hist_ke, pts_ke);
+					build_curve(hist_pe, pts_pe);
+					build_curve(hist_te, pts_te);
+					if((int)pts_ke.size()>=2) dl->AddPolyline(pts_ke.data(), (int)pts_ke.size(), col_ke, ImDrawFlags_None, 1.5f);
+					if((int)pts_pe.size()>=2) dl->AddPolyline(pts_pe.data(), (int)pts_pe.size(), col_pe, ImDrawFlags_None, 1.5f);
+					if((int)pts_te.size()>=2) dl->AddPolyline(pts_te.data(), (int)pts_te.size(), col_te, ImDrawFlags_None, 1.5f);
+				}
+
+				// Inline legend: small color swatches + names in the top-left of the plot.
+				{
+					float lx = en_left+8.0f;
+					float ly = en_top +6.0f;
+					auto entry = [&](ImU32 col, const char* label) {
+						dl->AddRectFilled(ImVec2(lx, ly+3.0f), ImVec2(lx+14.0f, ly+13.0f), col);
+						dl->AddText(ImVec2(lx+20.0f, ly), col_text, label);
+						ly += 16.0f;
+					};
+					entry(col_ke, "KE");
+					entry(col_pe, "PE");
+					entry(col_te, "KE+PE");
+				}
+
+				char xt_hi_e[32], yt_hi_e[32], yt_lo_e[32];
+				snprintf(xt_hi_e, sizeof(xt_hi_e), "%.1f", t_max);
+				if(energy_log) {
+					snprintf(yt_hi_e, sizeof(yt_hi_e), "1e%+d", (int)y_hi);
+					snprintf(yt_lo_e, sizeof(yt_lo_e), "1e%+d", (int)y_lo);
+				} else {
+					snprintf(yt_hi_e, sizeof(yt_hi_e), "%.2f", y_hi);
+					snprintf(yt_lo_e, sizeof(yt_lo_e), "%.2f", y_lo);
+				}
+				draw_plot_frame(en_left, en_top, en_right, en_bot,
+					"energy",
+					"t  (omega_p t)", "0",      xt_hi_e,
+					"energy",         yt_lo_e,  yt_hi_e, nullptr);
 			}
 		}
 

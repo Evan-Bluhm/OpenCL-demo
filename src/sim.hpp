@@ -1,6 +1,5 @@
 #pragma once
 
-#include <random>
 #include "opencl.hpp"
 // NOTE: do not include kernel.hpp here — its R(...) stringification macro
 // pollutes any subsequent header (e.g. <random>) that uses `R` as an identifier.
@@ -126,11 +125,12 @@ public:
 	inline Memory<float>& v_next() { return curr==0 ? v_b : v_a; }
 	inline Memory<float>& s_next() { return curr==0 ? stream_b : stream_a; }
 
-	// Two counter-streaming Maxwellians, uniform x with a small sinusoidal seed.
-	inline void initialize_two_stream(uint seed=12345u) {
-		std::mt19937 rng(seed);
-		std::normal_distribution<float> gauss(0.0f, vt);
-		const float k0 = 2.0f*pif/L; // one-wavelength perturbation across the box
+	// Two cold counter-streaming beams, positions perturbed by a single sinusoid
+	// at wavenumber mode_k*2pi/L. With no thermal noise, only the seeded mode
+	// (and its harmonics generated nonlinearly) get excited — useful for picking
+	// off individual k-modes for linear-theory comparison.
+	inline void initialize_two_stream(uint mode_k=1u) {
+		const float k0 = (float)mode_k*2.0f*pif/L; // mode_k wavelengths across the box
 		// Reset curr first so x_curr()/v_curr()/s_curr() below resolve to the
 		// buffers that will be live after init, not whatever was live before.
 		curr = 0;
@@ -149,7 +149,7 @@ public:
 			if(xp<0.0f) xp += L;
 			if(xp>=L)   xp -= L;
 			xb[i] = xp;
-			vb[i] = v_mean+gauss(rng);
+			vb[i] = v_mean;
 			sb[i] = right_mover ? 0.0f : 1.0f;
 		}
 		xb.write_to_device();
