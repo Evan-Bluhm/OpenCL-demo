@@ -131,6 +131,9 @@ public:
 		std::mt19937 rng(seed);
 		std::normal_distribution<float> gauss(0.0f, vt);
 		const float k0 = 2.0f*pif/L; // one-wavelength perturbation across the box
+		// Reset curr first so x_curr()/v_curr()/s_curr() below resolve to the
+		// buffers that will be live after init, not whatever was live before.
+		curr = 0;
 		Memory<float>& xb = x_curr();
 		Memory<float>& vb = v_curr();
 		Memory<float>& sb = s_curr();
@@ -154,7 +157,6 @@ public:
 		sb.write_to_device();
 		t = 0.0;
 		step_count = 0u;
-		curr = 0;
 	}
 
 	// One full timestep.
