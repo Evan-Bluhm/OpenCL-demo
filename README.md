@@ -12,18 +12,29 @@ System dependencies (one-time):
 
 - macOS:  `brew install glfw`
 - Linux:  `sudo apt install libglfw3-dev libglew-dev ocl-icd-libopencl1 ocl-icd-opencl-dev`
+- Windows: Visual Studio 2019 or 2022 with the "Desktop development with C++" workload (the free Build Tools edition is fine), plus `git` on `PATH`. GLFW and GLEW are auto-downloaded.
 
 Then:
 
 ```
-make             # build bin/two_stream
+make             # build bin/two_stream            (macOS / Linux)
 make run         # build and run
 make run ARGS=0  # run on OpenCL device 0 (omit ARGS to auto-pick the highest-FLOPS device)
 make clean       # remove app objects and binary
 make distclean   # also remove the cached ImGui static archive
 ```
 
-Dear ImGui (`v1.91.0`) is auto-fetched into `extern/imgui/` on first build and compiled once into `extern/imgui/build/libimgui.a`, so subsequent incremental builds are fast.
+On Windows, use `build.bat` from any `cmd` window — it auto-locates MSVC via `vswhere`, so you do not need to launch a Developer Command Prompt yourself:
+
+```
+build.bat              :: build bin\two_stream.exe
+build.bat run          :: build and run
+build.bat run 0        :: run on OpenCL device 0
+build.bat clean        :: remove app objects and binary
+build.bat distclean    :: also remove the cached ImGui/GLFW/GLEW downloads
+```
+
+Dear ImGui (`v1.91.0`) is auto-fetched into `extern/imgui/` on first build and compiled once into `extern/imgui/build/libimgui.a` (or `imgui.lib` on Windows), so subsequent incremental builds are fast. On Windows, `build.bat` also fetches prebuilt GLFW and GLEW binaries into `extern/glfw/` and `extern/glew/`, and copies `glfw3.dll` + `glew32.dll` next to the `.exe`.
 
 ## Running
 
@@ -61,7 +72,9 @@ demo-apps/
 │   ├── utilities.hpp      shared helpers
 │   └── OpenCL/            Khronos OpenCL headers (vendored for portability)
 ├── extern/imgui/          fetched at build time (gitignored)
-├── Makefile
+├── extern/glfw/, glew/    fetched by build.bat on Windows (gitignored)
+├── Makefile               macOS / Linux build
+├── build.bat              Windows MSVC build
 ├── compile_flags.txt      clangd include paths
 └── README.md
 ```
